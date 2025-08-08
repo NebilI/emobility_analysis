@@ -1,11 +1,13 @@
 import os
 import json
+import time
 import argparse
+import base64
+import fitz  # PyMuPDF
 
 import pydantic
 import polars as pl
 from openai import OpenAI
-from pypdf import PdfReader
 from dotenv import load_dotenv
 
 # --- Configuration ---
@@ -13,8 +15,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- CHOOSE YOUR PROVIDER ---
-# Set to "openai" or "gemini" to select the API provider.
-PROVIDER = "gemini"  # <-- CHANGE THIS TO "openai" OR "gemini"
+# Set to "gemini" for vision capabilities.
+PROVIDER = "gemini"
 
 if PROVIDER == "gemini":
     # For Gemini, you need an API key from Google AI Studio (https://aistudio.google.com/app/apikey)
@@ -28,23 +30,12 @@ if PROVIDER == "gemini":
     
     print("Using Gemini provider.")
     client = OpenAI(api_key=api_key, base_url=base_url)
-    # The model name for Gemini API via an OpenAI-compatible endpoint is often the full path.
-    MODEL = "models/gemini-2.0-flash"
-
-elif PROVIDER == "openai":
-    # For OpenAI, the client uses the OPENAI_API_KEY from your .env file by default.
-    print("Using OpenAI provider.")
-    client = OpenAI()
-    MODEL = "gpt-4o"  # Or "gpt-4-turbo"
+    # Use a model that supports vision input
+    MODEL = "models/gemini-2.5-flash" 
 else:
-    raise ValueError(f"Unsupported provider: '{PROVIDER}'. Choose 'openai' or 'gemini'.")
+    raise ValueError(f"Unsupported provider: '{PROVIDER}'. This script requires 'gemini' for vision capabilities.")
     
 # --- Data Structure Definition using Pydantic ---
-# We define the exact structure we want to extract from the PDF.
-# Pydantic models ensure the data returned by the AI is in the correct format.
-# Using `Field(alias=...)` lets us use user-friendly names in the output
-# while having clean, Python-friendly variable names in our code.
-
 class PowerCabinetSpecs(pydantic.BaseModel):
     """Extracted specifications for a power cabinet or all-in-one EV charging unit."""
     model: str | None = pydantic.Field(
@@ -105,7 +96,6 @@ class PowerCabinetSpecs(pydantic.BaseModel):
         None, serialization_alias="CMS", description="Charging Management System details (e.g., OCPP 1.6J)."
     )
     cable_length: str | None = pydantic.Field(
-        # Note: Corrected typo from "lenght" to "length"
         None, serialization_alias="Cable length", description="The length of the charging cable(s)."
     )
     cable_reach: str | None = pydantic.Field(
@@ -116,14 +106,12 @@ class PowerCabinetSpecs(pydantic.BaseModel):
     )
 
     class Config:
-        # This allows creating the model using aliases
         populate_by_name = True
 
 def convert_schema_for_gemini(properties: dict) -> dict:
     fixed = {}
     for k, v in properties.items():
         if "anyOf" in v:
-            # Extract the type that is not null
             for option in v["anyOf"]:
                 if option.get("type") != "null":
                     v["type"] = option["type"]
@@ -132,56 +120,71 @@ def convert_schema_for_gemini(properties: dict) -> dict:
         fixed[k] = v
     return fixed
 
-def extract_text_from_pdf(pdf_path: str) -> str:
+def convert_pdf_pages_to_images(pdf_path: str) -> list[str]:
     """
-    Extracts text from all pages of a PDF file.
+    Converts each page of a PDF into a base64 encoded image string.
 
     Args:
         pdf_path: The file path to the PDF.
 
     Returns:
-        A single string containing all the text from the PDF.
+        A list of base64 encoded image strings.
     """
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"The file was not found at: {pdf_path}")
-    
-    print(f"Reading text from '{pdf_path}'...")
-    reader = PdfReader(pdf_path)
-    all_text = []
-    for i, page in enumerate(reader.pages):
-        try:
-            all_text.append(page.extract_text() or "")
-        except Exception as e:
-            print(f"Could not extract text from page {i+1}: {e}")
-    
-    print("Finished reading PDF text.")
-    return "\n".join(all_text)
 
+    print(f"Converting PDF pages to images from '{pdf_path}'...")
+    doc = fitz.open(pdf_path)
+    base64_images = []
 
-def get_specs_from_text(text: str) -> PowerCabinetSpecs:
+    for page_index in range(len(doc)):
+        page: fitz.Page = doc.load_page(page_index)
+        pix = page.get_pixmap(dpi=200) # Higher DPI for better quality
+        img_bytes = pix.tobytes("jpeg")
+        base64_images.append(base64.b64encode(img_bytes).decode('utf-8'))
+
+    doc.close()
+    print(f"Successfully converted {len(base64_images)} pages to images.")
+    return base64_images
+
+def get_specs_from_images(images: list[str]) -> PowerCabinetSpecs:
     """
-    Uses OpenAI's function calling to extract structured data from text.
+    Uses a multimodal AI to extract structured data from a list of images.
 
     Args:
-        text: The text content from the PDF.
+        images: A list of base64 encoded image strings.
 
     Returns:
         A Pydantic object containing the extracted specifications.
     """
-    print("Sending text to OpenAI for extraction...")
+    print(f"Sending {len(images)} images to Gemini for extraction...")
+    
+    # Construct the messages for the API call
+    messages = [
+        {
+            "role": "system",
+            "content": "You are an expert at extracting technical specifications from documents for EV charging power cabinets and all-in-one units. Please extract the information based on the user's request from the provided text. If a value is not found, leave it as null.",
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Extract the specifications from the following page images:"
+                },
+            ] + [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img}"}
+                } for img in images
+            ]
+        }
+    ]
+
     try:
         response = client.chat.completions.create(
             model=MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert at extracting technical specifications from documents for EV charging power cabinets and all-in-one units. Please extract the information based on the user's request from the provided text. If a value is not found, leave it as null.",
-                },
-                {
-                    "role": "user",
-                    "content": text,
-                },
-            ],
+            messages=messages,
             tools=[
                 {
                     "type": "function",
@@ -189,10 +192,10 @@ def get_specs_from_text(text: str) -> PowerCabinetSpecs:
                         "name": "extract_power_cabinet_specs",
                         "description": "Extracts technical specifications from a document.",
                         "parameters": {
-                                        "type": "object",
-                                        "properties": convert_schema_for_gemini(PowerCabinetSpecs.model_json_schema(by_alias=True)["properties"]),
-                                        "required": []  # Optional: you can explicitly set required fields
-                                    },
+                            "type": "object",
+                            "properties": convert_schema_for_gemini(PowerCabinetSpecs.model_json_schema(by_alias=True)["properties"]),
+                            "required": []
+                        },
                     },
                 }
             ],
@@ -202,52 +205,45 @@ def get_specs_from_text(text: str) -> PowerCabinetSpecs:
             },
         )
 
-        tool_call = response.choices[0].message.tool_calls[0] # type: ignore
+        tool_call = response.choices[0].message.tool_calls[0]
         if tool_call.function.name == "extract_power_cabinet_specs":
-            print("OpenAI returned structured data. Parsing results...")
+            print("Gemini returned structured data. Parsing results...")
             arguments = json.loads(tool_call.function.arguments)
             return PowerCabinetSpecs.model_validate(arguments)
         else:
             raise ValueError(f"Expected function 'extract_power_cabinet_specs' but got '{tool_call.function.name}'")
 
     except Exception as e:
-
-        import pprint
-        print("\n--- Final Schema Sent to Gemini ---")
-        pprint.pprint(PowerCabinetSpecs.model_json_schema(by_alias=True)["properties"])
-        print("------------------------------------\n")
-        print(f"An error occurred during OpenAI API call: {e}")
+        print(f"An error occurred during Gemini API call: {e}")
         raise
 
-
 def main():
-    """Main function to run the PDF spec extraction process."""
+    """Main function to run the PDF image-based spec extraction process."""
     parser = argparse.ArgumentParser(
-        description="Extract technical specifications from a PDF data sheet into a CSV file."
+        description="Extract technical specifications from a PDF data sheet using vision capabilities."
     )
     parser.add_argument(
         "pdf_file",
-        nargs="?",  # Make the positional argument optional
+        nargs="?",
         default=r"C:\Users\Nebil Ibrahim\Downloads\ABB_Emobility_Terra-360_UL_Data-Sheet_A.pdf",
         help="Path to the input PDF file. Defaults to a sample Terra 360 datasheet."
     )
     parser.add_argument(
         "--output", "-o",
-        default="extracted_specs.csv",
-        help="Path for the output CSV file. Defaults to 'extracted_specs.csv'."
+        default="extracted_specs_vision.csv",
+        help="Path for the output CSV file. Defaults to 'extracted_specs_vision.csv'."
     )
     args = parser.parse_args()
 
     try:
-        pdf_text = extract_text_from_pdf(args.pdf_file)
+        pdf_images = convert_pdf_pages_to_images(args.pdf_file)
 
-        if not pdf_text.strip():
-            print("Could not extract any text from the PDF. It might be an image-based PDF.")
-            print("Consider using an OCR tool first to convert the PDF to text.")
+        if not pdf_images:
+            print("Could not convert any pages from the PDF to images.")
             return
-
-        extracted_specs = get_specs_from_text(pdf_text)
-
+        start = time.time()
+        extracted_specs = get_specs_from_images(pdf_images)
+        print("Elapsed Time:", time.time() - start, " seconds")
         print("\n--- Extracted Specifications ---")
         print(json.dumps(extracted_specs.model_dump(by_alias=True, exclude_none=True), indent=2))
         print("------------------------------")
@@ -263,7 +259,6 @@ def main():
         print("Please check if the provided PDF file path is correct.")
     except Exception as e:
         print(f"\nAn unexpected error occurred: {e}")
-
 
 if __name__ == "__main__":
     main()
